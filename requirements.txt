@@ -6,6 +6,6 @@ networkx
 matplotlib
 opencage
 spacy
-seabron
+seaborn
 sentence-transformers
 numpy
