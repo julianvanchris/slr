@@ -447,17 +447,120 @@ def create_method_distribution(papers_metadata):
     plt.close()
     return buf
 
+def extract_info_from_abstract(abstract_text):
+    """
+    Given an abstract, use the LLM to extract:
+      - Methods Used
+      - Keywords
+      - Research Field
+    """
+    prompt = f"""
+    You have an abstract from a scientific paper. Extract the following:
+    - Methods Used (list them, comma-separated)
+    - Keywords (list them, comma-separated)
+    - Research Field (one short phrase)
+
+    Format them as:
+    Methods: [method1], [method2]
+    Keywords: [keyword1], [keyword2]
+    Research Field: [field]
+
+    Abstract:
+    {abstract_text}
+    """
+    try:
+        response = model.generate_content(prompt)
+        lines = response.text.splitlines()
+        info = {"Methods": [], "Keywords": [], "Research Field": ""}
+
+        for line in lines:
+            line = line.strip()
+            if line.lower().startswith("methods:"):
+                methods_str = line.split(":", 1)[1].strip()
+                info["Methods"] = [m.strip() for m in methods_str.split(",") if m.strip()]
+            elif line.lower().startswith("keywords:"):
+                keywords_str = line.split(":", 1)[1].strip()
+                info["Keywords"] = [k.strip() for k in keywords_str.split(",") if k.strip()]
+            elif line.lower().startswith("research field:"):
+                info["Research Field"] = line.split(":", 1)[1].strip()
+        
+        return info
+    except Exception as e:
+        st.warning(f"Error extracting info from abstract: {str(e)}")
+        return {
+            "Methods": [],
+            "Keywords": [],
+            "Research Field": ""
+        }
+        
+def search_scopus_by_keywords(metadata):
+    """
+    Search for similar papers using the extracted keywords from a single paper's metadata.
+    1) Build query from metadata['Keywords']
+    2) Fetch the abstract from Scopus results
+    3) Use extract_info_from_abstract() to parse each abstract for methods, keywords, and field
+
+    Returns a list of dictionaries, each containing:
+      - Title
+      - Authors
+      - Year
+      - DOI
+      - Abstract
+      - Extracted: { Methods, Keywords, Research Field }
+    """
+    # Gather keywords from this paper's metadata
+    paper_keywords = metadata.get("Keywords", [])
+    if not paper_keywords:
+        return []
+
+    # Build query string from keywords
+    # Example: for keywords ["machine learning", "classification"] => TITLE-ABS-KEY("machine learning") AND TITLE-ABS-KEY("classification")
+    query_parts = [f'TITLE-ABS-KEY("{kw}")' for kw in paper_keywords]
+    combined_query = " AND ".join(query_parts)
+    
+    # Prepare request
+    base_url = "https://api.elsevier.com/content/search/scopus"
+    headers = {"X-ELS-APIKey": SCOPUS_API_KEY}
+    params = {
+        "query": f"({combined_query}) AND openaccess(1)",
+        "count": 5,  # adjust how many results you want
+        "field": "dc:title,dc:creator,prism:coverDate,prism:doi,dc:description"
+    }
+
+    similar_papers = []
+    try:
+        resp = requests.get(base_url, headers=headers, params=params)
+        if resp.ok:
+            entries = resp.json().get("search-results", {}).get("entry", [])
+            for entry in entries:
+                title = entry.get("dc:title", "")
+                authors = entry.get("dc:creator", "")
+                year = entry.get("prism:coverDate", "")[:4]
+                doi = entry.get("prism:doi", "")
+                abstract = entry.get("dc:description", "")
+
+                # Extract methods, keywords, field from the abstract
+                extracted_info = extract_info_from_abstract(abstract)
+
+                similar_papers.append({
+                    "Title": title,
+                    "Authors": authors,
+                    "Year": year,
+                    "DOI": doi,
+                    "Abstract": abstract,
+                    "Extracted Methods": extracted_info["Methods"],
+                    "Extracted Keywords": extracted_info["Keywords"],
+                    "Extracted Field": extracted_info["Research Field"],
+                })
+        else:
+            st.warning(f"Scopus request failed with status code {resp.status_code}")
+    except Exception as e:
+        st.error(f"Error searching Scopus with keywords: {str(e)}")
+
+    return similar_papers
+
 # Main UI
 st.title("📚 Scientific Paper Analyzer")
-
-st.sidebar.header("Configuration")
-confidence_threshold = st.sidebar.slider(
-    "Geocoding Confidence Threshold",
-    min_value=0,
-    max_value=10,
-    value=5,
-    help="Filter out locations with confidence score below this threshold"
-)
 
 uploaded_files = st.file_uploader(
     "Upload scientific papers (PDF)",
@@ -514,6 +617,16 @@ if st.session_state.papers_metadata:
     elif viz_option == "Method Distribution":
         st.image(create_method_distribution(st.session_state.papers_metadata))
     
+    # Place the slider in the main page
+    st.subheader("Configuration")
+    confidence_threshold = st.slider(
+        "Geocoding Confidence Threshold",
+        min_value=0,
+        max_value=10,
+        value=5,
+        help="Filter out locations with confidence score below this threshold"
+    )
+
     # Research locations map
     st.subheader("Research Locations")
     map_data = []
@@ -651,134 +764,190 @@ def format_citation_with_link(title, authors, year, doi):
 
 def search_scopus_categorized(metadata):
     """Search for similar papers in Scopus based on three categories."""
+    # Initialize results dictionary with empty lists
     results = {
         'method_based': [],
         'keyword_based': [],
         'field_based': []
     }
     
+    # If no metadata is provided, return empty results
+    if not metadata:
+        return results
+    
     methods = metadata.get('Methods Used', [])
     keywords = metadata.get('Keywords', [])
     field = metadata.get('Research Field', '')
     
-    headers = {"X-ELS-APIKey": SCOPUS_API_KEY}
-    base_url = "https://api.elsevier.com/content/search/scopus"
-    field_params = "dc:title,dc:creator,prism:coverDate,prism:doi"
+    try:
+        headers = {"X-ELS-APIKey": SCOPUS_API_KEY}
+        base_url = "https://api.elsevier.com/content/search/scopus"
+        field_params = "dc:title,dc:creator,prism:coverDate,prism:doi"
+        
+        # Search by methods
+        if methods:
+            method_query = ' OR '.join(f'TITLE-ABS-KEY("{method}")' for method in methods)
+            params = {
+                "query": f"({method_query}) AND openaccess(1)",
+                "count": 5,
+                "field": field_params
+            }
+            try:
+                response = requests.get(base_url, headers=headers, params=params)
+                if response.ok:
+                    entries = response.json().get('search-results', {}).get('entry', [])
+                    for entry in entries:
+                        citation = format_citation_with_link(
+                            entry.get('dc:title', 'Untitled'),
+                            entry.get('dc:creator', 'Unknown'),
+                            entry.get('prism:coverDate', '')[:4],
+                            entry.get('prism:doi', '')
+                        )
+                        results['method_based'].append(citation)
+            except Exception as e:
+                st.warning(f"Error in method-based search: {str(e)}")
+        
+        # Search by keywords
+        if keywords:
+            keyword_query = ' OR '.join(f'TITLE-ABS-KEY("{keyword}")' for keyword in keywords)
+            params = {
+                "query": f"({keyword_query}) AND openaccess(1)",
+                "count": 5,
+                "field": field_params
+            }
+            try:
+                response = requests.get(base_url, headers=headers, params=params)
+                if response.ok:
+                    entries = response.json().get('search-results', {}).get('entry', [])
+                    for entry in entries:
+                        citation = format_citation_with_link(
+                            entry.get('dc:title', 'Untitled'),
+                            entry.get('dc:creator', 'Unknown'),
+                            entry.get('prism:coverDate', '')[:4],
+                            entry.get('prism:doi', '')
+                        )
+                        results['keyword_based'].append(citation)
+            except Exception as e:
+                st.warning(f"Error in keyword-based search: {str(e)}")
+        
+        # Search by research field
+        if field:
+            params = {
+                "query": f'TITLE-ABS-KEY("{field}") AND openaccess(1)',
+                "count": 5,
+                "field": field_params
+            }
+            try:
+                response = requests.get(base_url, headers=headers, params=params)
+                if response.ok:
+                    entries = response.json().get('search-results', {}).get('entry', [])
+                    for entry in entries:
+                        citation = format_citation_with_link(
+                            entry.get('dc:title', 'Untitled'),
+                            entry.get('dc:creator', 'Unknown'),
+                            entry.get('prism:coverDate', '')[:4],
+                            entry.get('prism:doi', '')
+                        )
+                        results['field_based'].append(citation)
+            except Exception as e:
+                st.warning(f"Error in field-based search: {str(e)}")
     
-    # Search by methods
-    if methods:
-        method_query = ' OR '.join(f'TITLE-ABS-KEY("{method}")' for method in methods)
-        params = {
-            "query": f"({method_query}) AND openaccess(1)",
-            "count": 5,
-            "field": field_params
-        }
-        try:
-            response = requests.get(base_url, headers=headers, params=params)
-            if response.ok:
-                entries = response.json().get('search-results', {}).get('entry', [])
-                for entry in entries:
-                    citation = format_citation_with_link(
-                        entry.get('dc:title', 'Untitled'),
-                        entry.get('dc:creator', 'Unknown'),
-                        entry.get('prism:coverDate', '')[:4],
-                        entry.get('prism:doi', '')
-                    )
-                    results['method_based'].append(citation)
-        except Exception as e:
-            st.warning(f"Error in method-based search: {str(e)}")
+    except Exception as e:
+        st.error(f"Error in Scopus search: {str(e)}")
     
-    # Search by keywords
-    if keywords:
-        keyword_query = ' OR '.join(f'TITLE-ABS-KEY("{keyword}")' for keyword in keywords)
-        params = {
-            "query": f"({keyword_query}) AND openaccess(1)",
-            "count": 5,
-            "field": field_params
-        }
-        try:
-            response = requests.get(base_url, headers=headers, params=params)
-            if response.ok:
-                entries = response.json().get('search-results', {}).get('entry', [])
-                for entry in entries:
-                    citation = format_citation_with_link(
-                        entry.get('dc:title', 'Untitled'),
-                        entry.get('dc:creator', 'Unknown'),
-                        entry.get('prism:coverDate', '')[:4],
-                        entry.get('prism:doi', '')
-                    )
-                    results['keyword_based'].append(citation)
-        except Exception as e:
-            st.warning(f"Error in keyword-based search: {str(e)}")
-    
-    # Search by research field
-    if field:
-        params = {
-            "query": f'TITLE-ABS-KEY("{field}") AND openaccess(1)',
-            "count": 5,
-            "field": field_params
-        }
-        try:
-            response = requests.get(base_url, headers=headers, params=params)
-            if response.ok:
-                entries = response.json().get('search-results', {}).get('entry', [])
-                for entry in entries:
-                    citation = format_citation_with_link(
-                        entry.get('dc:title', 'Untitled'),
-                        entry.get('dc:creator', 'Unknown'),
-                        entry.get('prism:coverDate', '')[:4],
-                        entry.get('prism:doi', '')
-                    )
-                    results['field_based'].append(citation)
-        except Exception as e:
-            st.warning(f"Error in field-based search: {str(e)}")
-    
+    # Always return results, even if empty
     return results
 
-# Replace your existing similar papers section with this new code
-# Add this after your existing visualizations (network graph, heatmap, etc.)
-# if st.session_state.papers_metadata:
-#     st.subheader("Similar Papers from Scopus")
+
+def search_scopus_combined_criteria(metadata):
+    """Search for papers that match multiple criteria (methods, keywords, and field) simultaneously."""
+    if not metadata:
+        return []
     
-#     # Create tabs for all papers
-#     tab_names = [f"Paper {i+1}: {paper.get('Title', 'Untitled')}" 
-#                  for i, paper in enumerate(st.session_state.papers_metadata)]
-#     tabs = st.tabs(tab_names)
+    try:
+        headers = {"X-ELS-APIKey": SCOPUS_API_KEY}
+        base_url = "https://api.elsevier.com/content/search/scopus"
+        field_params = "dc:title,dc:creator,prism:coverDate,prism:doi,citedby-count"
+        
+        # Get search criteria
+        methods = metadata.get('Methods Used', [])
+        keywords = metadata.get('Keywords', [])
+        field = metadata.get('Research Field', '')
+        
+        # Build combined query
+        query_parts = []
+        
+        # Add methods to query
+        if methods:
+            methods_query = ' AND '.join(f'TITLE-ABS-KEY("{method}")' for method in methods[:2])  # Limit to top 2 methods
+            query_parts.append(f"({methods_query})")
+            
+        # Add keywords to query
+        if keywords:
+            keywords_query = ' AND '.join(f'TITLE-ABS-KEY("{keyword}")' for keyword in keywords[:2])  # Limit to top 2 keywords
+            query_parts.append(f"({keywords_query})")
+            
+        # Add research field to query
+        if field:
+            query_parts.append(f'TITLE-ABS-KEY("{field}")')
+        
+        # Combine all parts with AND
+        if query_parts:
+            combined_query = ' AND '.join(query_parts)
+            
+            params = {
+                "query": f"({combined_query}) AND openaccess(1)",
+                "count": 10,  # Increased count since we're being more specific
+                "sort": "-citedby-count",  # Sort by citation count
+                "field": field_params
+            }
+            
+            response = requests.get(base_url, headers=headers, params=params)
+            
+            if response.ok:
+                results = []
+                entries = response.json().get('search-results', {}).get('entry', [])
+                
+                for entry in entries:
+                    # Calculate relevance score based on matching criteria
+                    title = entry.get('dc:title', '').lower()
+                    relevance_score = 0
+                    
+                    # Check for method matches in title
+                    for method in methods:
+                        if method.lower() in title:
+                            relevance_score += 1
+                            
+                    # Check for keyword matches in title
+                    for keyword in keywords:
+                        if keyword.lower() in title:
+                            relevance_score += 1
+                    
+                    # Get citation count
+                    citation_count = int(entry.get('citedby-count', 0))
+                    
+                    # Create result entry
+                    result = {
+                        'citation': format_citation_with_link(
+                            entry.get('dc:title', 'Untitled'),
+                            entry.get('dc:creator', 'Unknown'),
+                            entry.get('prism:coverDate', '')[:4],
+                            entry.get('prism:doi', '')
+                        ),
+                        'relevance_score': relevance_score,
+                        'citation_count': citation_count
+                    }
+                    results.append(result)
+                
+                # Sort results by relevance score and citation count
+                results.sort(key=lambda x: (x['relevance_score'], x['citation_count']), reverse=True)
+                return results
+                
+    except Exception as e:
+        st.error(f"Error in Scopus search: {str(e)}")
+        return []
     
-#     # Handle each paper in its own tab
-#     for i, tab in enumerate(tabs):
-#         with tab:
-#             paper = st.session_state.papers_metadata[i]
-#             similar_papers = search_scopus_categorized(paper)
-            
-#             # Display method-based results
-#             col1, col2, col3 = st.columns(3)
-            
-#             with col1:
-#                 st.markdown("### 📊 Similar Methods")
-#                 if similar_papers['method_based']:
-#                     for citation in similar_papers['method_based']:
-#                         st.write(citation)
-#                 else:
-#                     st.write("No papers found.")
-            
-#             with col2:
-#                 st.markdown("### 🔑 Similar Keywords")
-#                 if similar_papers['keyword_based']:
-#                     for citation in similar_papers['keyword_based']:
-#                         st.write(citation)
-#                 else:
-#                     st.write("No papers found.")
-            
-#             with col3:
-#                 st.markdown("### 📚 Same Field")
-#                 if similar_papers['field_based']:
-#                     for citation in similar_papers['field_based']:
-#                         st.write(citation)
-#                 else:
-#                     st.write("No papers found.")
-    
-    # Add download functionality for categorized similar papers report
+# Add download functionality for categorized similar papers report
 def generate_categorized_papers_report():
         report = "# Categorized Similar Papers Report\n\n"
         
@@ -925,7 +1094,71 @@ if st.session_state.papers_metadata:
     st.download_button(
         label="Download Similar Papers Report",
         data=report,
-        file_name="similar_papers_report.md",
+        file_name="similar_papers_report.txt",
         mime="text/markdown"
     )
 
+if st.session_state.papers_metadata:
+    # st.subheader("Similar Papers from Scopus")
+    
+    for i, paper in enumerate(st.session_state.papers_metadata):
+        st.markdown(f"### Paper {i+1}: {paper.get('Title', 'Untitled')}")
+        
+        # Get similar papers using combined criteria
+        similar_papers = search_scopus_combined_criteria(paper)
+        
+        if similar_papers:
+            st.markdown("#### Most Similar Papers (matching multiple criteria)")
+            for idx, result in enumerate(similar_papers, 1):
+                citation = result['citation']
+                relevance = result['relevance_score']
+                citations = result['citation_count']
+                
+                # Create expandable section for each paper
+                with st.expander(f"Similar Paper {idx} (Relevance Score: {relevance}, Citations: {citations})"):
+                    st.write(citation)
+                    
+                    # Show matching criteria
+                    matches = []
+                    if relevance > 0:
+                        matches.append("✓ Matching methods/keywords in title")
+                    if citations > 0:
+                        matches.append(f"✓ Cited {citations} times")
+                    
+                    if matches:
+                        st.markdown("**Matching Criteria:**")
+                        for match in matches:
+                            st.markdown(match)
+        else:
+            st.info("No papers found matching multiple criteria. Try adjusting the search parameters.")
+        
+        st.markdown("---")
+
+    # Add download functionality for similar papers report
+    def generate_combined_papers_report():
+        report = "# Similar Papers Report (Combined Criteria)\n\n"
+        
+        for paper in st.session_state.papers_metadata:
+            report += f"## Original Paper: {paper.get('Title', 'Untitled')}\n\n"
+            similar_papers = search_scopus_combined_criteria(paper)
+            
+            if similar_papers:
+                report += "### Similar Papers:\n\n"
+                for idx, result in enumerate(similar_papers, 1):
+                    report += f"#### {idx}. {result['citation']}\n"
+                    report += f"- Relevance Score: {result['relevance_score']}\n"
+                    report += f"- Citations: {result['citation_count']}\n\n"
+            else:
+                report += "No similar papers found matching multiple criteria.\n\n"
+            
+            report += "---\n\n"
+                   
+        return report
+
+    report = generate_combined_papers_report()
+    st.download_button(
+        label="Download Similar Combined Papers Report",
+        data=report,
+        file_name="similar_papers_combined_report.txt",
+        mime="text/markdown"
+    )
